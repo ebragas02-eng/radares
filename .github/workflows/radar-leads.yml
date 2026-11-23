@@ -1,7 +1,10 @@
 name: Radar - empresas novas de SP (base aberta do CNPJ)
+# Funciona sozinho: roda todo dia útil às 7h de Brasília. Se o mês já foi enviado à Arizona (marca no cache do GitHub),
+# termina em segundos. Se a Receita estiver fora do ar ou derrubar o download, falha e tenta de novo no dia útil seguinte,
+# até conseguir. A Receita publica a base uma vez por mês; a Arizona ignora empresa repetida.
 on:
   schedule:
-    - cron: '0 10 * * 1'   # toda segunda, 7h de Brasília; a Arizona ignora empresa repetida
+    - cron: '0 10 * * 1-5'
   workflow_dispatch:
 permissions:
   contents: read
@@ -9,10 +12,10 @@ permissions:
 jobs:
   leads:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
-      - name: Baixa a base mais recente da Receita
+      - name: Descobre a base mais recente da Receita
         run: |
           T=YggdBLfdninEJX9; B=https://arquivos.receitafederal.gov.br/public.php/webdav
           M=""
@@ -21,24 +24,43 @@ jobs:
             [ -n "$M" ] && break; echo "lista da Receita sem resposta (tentativa $i), esperando"; sleep 60
           done
           if [ -z "$M" ]; then
-            # sem a lista: tenta o mês atual e o anterior direto pelo arquivo
             for c in $(date +%Y-%m) $(date -d "$(date +%Y-%m-01) -1 month" +%Y-%m); do
               if curl -sS -m 120 -u "$T:" -o /dev/null -w '%{http_code}' -I "$B/$c/Cnaes.zip" | grep -q 200; then M=$c; break; fi
             done
           fi
-          if [ -z "$M" ]; then echo "::error::Servidor de dados abertos da Receita fora do ar; o radar tenta de novo na próxima segunda"; exit 1; fi
-          ALVO=$(date -d "$M-01 -1 month" +%Y%m); echo "base $M, empresas abertas em $ALVO"; echo "ALVO=$ALVO" >> $GITHUB_ENV
+          if [ -z "$M" ]; then echo "::error::Servidor de dados abertos da Receita fora do ar; o radar tenta de novo no próximo dia útil"; exit 1; fi
+          ALVO=$(date -d "$M-01 -1 month" +%Y%m); echo "base $M, empresas abertas em $ALVO"
+          echo "ALVO=$ALVO" >> $GITHUB_ENV; echo "BASE=$M" >> $GITHUB_ENV
+      - name: Confere se este mês já foi enviado
+        id: feito
+        uses: actions/cache/restore@v4
+        with:
+          path: feito.txt
+          key: radar-feito-${{ env.ALVO }}
+          lookup-only: true
+      - name: Baixa a base da Receita
+        if: steps.feito.outputs.cache-hit != 'true'
+        run: |
+          T=YggdBLfdninEJX9; B=https://arquivos.receitafederal.gov.br/public.php/webdav
           mkdir -p /tmp/rf && cd /tmp/rf
           # o servidor da Receita derruba a conexão no meio dos arquivos grandes: retoma de onde parou (-C -) até 12 vezes
           for f in Cnaes Municipios Simples Empresas{0..9} Estabelecimentos{0..9}; do
             ok=""
             for t in $(seq 1 12); do
-              if curl -sS -m 1800 -C - --retry 5 --retry-delay 15 --retry-all-errors -u "$T:" -o $f.zip "$B/$M/$f.zip" && unzip -tq $f.zip >/dev/null 2>&1; then ok=1; break; fi
+              if curl -sS -m 1800 -C - --retry 5 --retry-delay 15 --retry-all-errors -u "$T:" -o $f.zip "$B/$BASE/$f.zip" && unzip -tq $f.zip >/dev/null 2>&1; then ok=1; break; fi
               echo "$f.zip interrompido (tentativa $t), retomando"; sleep 30
             done
-            [ -n "$ok" ] || { echo "::error::$f.zip não baixou inteiro; o radar tenta de novo na próxima segunda"; exit 1; }
+            [ -n "$ok" ] || { echo "::error::$f.zip não baixou inteiro; o radar tenta de novo no próximo dia útil"; exit 1; }
           done
           ls -la | tail -3
       - name: Separa e manda à Arizona (o log mostra só contagens)
+        if: steps.feito.outputs.cache-hit != 'true'
         run: |
           python3 ferramentas/radar/radar.py leads /tmp/rf $ALVO
+          echo "$ALVO enviado em $(date -u +%FT%TZ)" > feito.txt
+      - name: Marca o mês como enviado
+        if: steps.feito.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: feito.txt
+          key: radar-feito-${{ env.ALVO }}
