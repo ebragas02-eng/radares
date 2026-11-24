@@ -63,7 +63,7 @@ jobs:
     timeout-minutes: 300
     strategy:
       fail-fast: false
-      max-parallel: 3        # poucos downloads ao mesmo tempo, para não sobrecarregar o servidor da Receita
+      max-parallel: 1        # um download por vez: com 3 ao mesmo tempo o servidor da Receita derrubava quase todas as conexões (24/11/2026)
       matrix:
         arq: [Cnaes, Municipios, Simples, Empresas0, Empresas1, Empresas2, Empresas3, Empresas4, Empresas5, Empresas6, Empresas7, Empresas8, Empresas9, Estabelecimentos0, Estabelecimentos1, Estabelecimentos2, Estabelecimentos3, Estabelecimentos4, Estabelecimentos5, Estabelecimentos6, Estabelecimentos7, Estabelecimentos8, Estabelecimentos9]
     steps:
@@ -74,7 +74,15 @@ jobs:
           path: /tmp/rf/${{ matrix.arq }}.zip
           key: radar-rf-${{ needs.base.outputs.BASE }}-${{ matrix.arq }}
           lookup-only: true
+      - name: Retoma o pedaço já baixado em rodadas anteriores
+        if: steps.tem.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/${{ matrix.arq }}.zip
+          key: radar-rf-parte-${{ needs.base.outputs.BASE }}-${{ matrix.arq }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: radar-rf-parte-${{ needs.base.outputs.BASE }}-${{ matrix.arq }}-
       - name: Baixa ${{ matrix.arq }}.zip
+        id: baixa
         if: steps.tem.outputs.cache-hit != 'true'
         env:
           BASE: ${{ needs.base.outputs.BASE }}
@@ -87,9 +95,15 @@ jobs:
             if curl -sS -m 1800 -C - --retry 5 --retry-delay 15 --retry-all-errors -u "$T:" -o $F.zip "$B/$BASE/$F.zip" && unzip -tq $F.zip >/dev/null 2>&1; then
               ls -la $F.zip; exit 0
             fi
-            echo "$F.zip interrompido (tentativa $t), retomando"; sleep 30
+            echo "$F.zip interrompido (tentativa $t, $(stat -c %s $F.zip 2>/dev/null || echo 0) bytes até agora), retomando"; sleep $(( t < 10 ? 30 * t : 300 ))
           done
           echo "::error::$F.zip não baixou inteiro; a próxima rodada baixa só o que faltou"; exit 1
+      - name: Guarda o pedaço baixado, para a próxima rodada continuar dele
+        if: (failure() || cancelled()) && steps.tem.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/rf/${{ matrix.arq }}.zip
+          key: radar-rf-parte-${{ needs.base.outputs.BASE }}-${{ matrix.arq }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Guarda no cache
         if: steps.tem.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
