@@ -1,7 +1,8 @@
 name: Radar - empresas novas de SP (base aberta do CNPJ)
 # Funciona sozinho: roda todo dia útil às 7h de Brasília. Se o mês já foi enviado à Arizona (marca no cache do GitHub),
-# termina em segundos. Se a Receita estiver fora do ar ou derrubar o download, falha e tenta de novo no dia útil seguinte,
-# até conseguir. A Receita publica a base uma vez por mês; a Arizona ignora empresa repetida.
+# termina em segundos. Cada arquivo da Receita é baixado num job próprio e guardado no cache do GitHub assim que chega
+# inteiro: se a Receita derrubar o download ou o tempo acabar, a rodada seguinte baixa só o que faltou (antes, uma queda
+# perdia tudo e o download inteiro não cabia no limite de tempo do job). A Arizona ignora empresa repetida.
 on:
   schedule:
     - cron: '0 10 * * 1-5'
@@ -14,13 +15,20 @@ on:
 permissions:
   contents: read
   id-token: write          # token OIDC do GitHub, conferido pela Arizona (sem senha guardada)
+concurrency:
+  group: radar-leads
+  cancel-in-progress: false
 jobs:
-  leads:
+  base:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 30
+    outputs:
+      BASE: ${{ steps.b.outputs.BASE }}
+      ALVO: ${{ steps.b.outputs.ALVO }}
+      feito: ${{ steps.feito.outputs.cache-hit }}
     steps:
-      - uses: actions/checkout@v4
       - name: Descobre a base mais recente da Receita
+        id: b
         env:
           BASE_PEDIDA: ${{ github.event.inputs.base }}
         run: |
@@ -39,7 +47,7 @@ jobs:
           fi
           if [ -z "$M" ]; then echo "::error::Servidor de dados abertos da Receita fora do ar; o radar tenta de novo no próximo dia útil"; exit 1; fi
           ALVO=$(date -d "$M-01 -1 month" +%Y%m); echo "base $M, empresas abertas em $ALVO"
-          echo "ALVO=$ALVO" >> $GITHUB_ENV; echo "BASE=$M" >> $GITHUB_ENV
+          echo "ALVO=$ALVO" >> $GITHUB_OUTPUT; echo "BASE=$M" >> $GITHUB_OUTPUT; echo "ALVO=$ALVO" >> $GITHUB_ENV
       - name: Confere se este mês já foi enviado
         id: feito
         uses: actions/cache/restore@v4
@@ -47,28 +55,177 @@ jobs:
           path: feito.txt
           key: radar-feito-${{ env.ALVO }}
           lookup-only: true
-      - name: Baixa a base da Receita
-        if: steps.feito.outputs.cache-hit != 'true'
+
+  baixa:
+    needs: base
+    if: needs.base.outputs.feito != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 3        # poucos downloads ao mesmo tempo, para não sobrecarregar o servidor da Receita
+      matrix:
+        arq: [Cnaes, Municipios, Simples, Empresas0, Empresas1, Empresas2, Empresas3, Empresas4, Empresas5, Empresas6, Empresas7, Empresas8, Empresas9, Estabelecimentos0, Estabelecimentos1, Estabelecimentos2, Estabelecimentos3, Estabelecimentos4, Estabelecimentos5, Estabelecimentos6, Estabelecimentos7, Estabelecimentos8, Estabelecimentos9]
+    steps:
+      - name: Já baixado numa rodada anterior?
+        id: tem
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/${{ matrix.arq }}.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-${{ matrix.arq }}
+          lookup-only: true
+      - name: Baixa ${{ matrix.arq }}.zip
+        if: steps.tem.outputs.cache-hit != 'true'
+        env:
+          BASE: ${{ needs.base.outputs.BASE }}
+          F: ${{ matrix.arq }}
         run: |
           T=YggdBLfdninEJX9; B=https://arquivos.receitafederal.gov.br/public.php/webdav
           mkdir -p /tmp/rf && cd /tmp/rf
-          # o servidor da Receita derruba a conexão no meio dos arquivos grandes: retoma de onde parou (-C -) até 12 vezes
-          for f in Cnaes Municipios Simples Empresas{0..9} Estabelecimentos{0..9}; do
-            ok=""
-            for t in $(seq 1 12); do
-              if curl -sS -m 1800 -C - --retry 5 --retry-delay 15 --retry-all-errors -u "$T:" -o $f.zip "$B/$BASE/$f.zip" && unzip -tq $f.zip >/dev/null 2>&1; then ok=1; break; fi
-              echo "$f.zip interrompido (tentativa $t), retomando"; sleep 30
-            done
-            [ -n "$ok" ] || { echo "::error::$f.zip não baixou inteiro; o radar tenta de novo no próximo dia útil"; exit 1; }
+          # o servidor da Receita derruba a conexão no meio dos arquivos grandes: retoma de onde parou (-C -)
+          for t in $(seq 1 20); do
+            if curl -sS -m 1800 -C - --retry 5 --retry-delay 15 --retry-all-errors -u "$T:" -o $F.zip "$B/$BASE/$F.zip" && unzip -tq $F.zip >/dev/null 2>&1; then
+              ls -la $F.zip; exit 0
+            fi
+            echo "$F.zip interrompido (tentativa $t), retomando"; sleep 30
           done
-          ls -la | tail -3
+          echo "::error::$F.zip não baixou inteiro; a próxima rodada baixa só o que faltou"; exit 1
+      - name: Guarda no cache
+        if: steps.tem.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/rf/${{ matrix.arq }}.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-${{ matrix.arq }}
+
+  envia:
+    needs: [base, baixa]
+    if: needs.base.outputs.feito != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ALVO: ${{ needs.base.outputs.ALVO }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Cnaes.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Cnaes
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Municipios.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Municipios
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Simples.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Simples
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Empresas0.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Empresas0
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Empresas1.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Empresas1
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Empresas2.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Empresas2
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Empresas3.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Empresas3
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Empresas4.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Empresas4
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Empresas5.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Empresas5
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Empresas6.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Empresas6
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Empresas7.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Empresas7
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Empresas8.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Empresas8
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Empresas9.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Empresas9
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Estabelecimentos0.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Estabelecimentos0
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Estabelecimentos1.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Estabelecimentos1
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Estabelecimentos2.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Estabelecimentos2
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Estabelecimentos3.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Estabelecimentos3
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Estabelecimentos4.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Estabelecimentos4
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Estabelecimentos5.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Estabelecimentos5
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Estabelecimentos6.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Estabelecimentos6
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Estabelecimentos7.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Estabelecimentos7
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Estabelecimentos8.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Estabelecimentos8
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/rf/Estabelecimentos9.zip
+          key: radar-rf-${{ needs.base.outputs.BASE }}-Estabelecimentos9
+          fail-on-cache-miss: true
       - name: Separa e manda à Arizona (o log mostra só contagens)
-        if: steps.feito.outputs.cache-hit != 'true'
         run: |
           python3 ferramentas/radar/radar.py leads /tmp/rf $ALVO
           echo "$ALVO enviado em $(date -u +%FT%TZ)" > feito.txt
       - name: Marca o mês como enviado
-        if: steps.feito.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: feito.txt
